@@ -48,6 +48,9 @@ import zipfile
 import torch
 from torch.utils.model_zoo import tqdm
 
+# misha: outdated ssl certificate workaround
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 
 def gen_bar_updater(total) -> Callable[[int, int, int], None]:
     pbar = tqdm(total=total, unit='Byte')
