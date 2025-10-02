@@ -1,6 +1,6 @@
 import copy
 from typing import List
-
+from functools import partial
 import numpy as np
 import torch
 import torchvision.transforms as transforms
@@ -84,60 +84,58 @@ def initialize_transform(
 
     return transform
 
+def get_bert_tokenizer(model):
+    if model == "bert-base-uncased":
+        return BertTokenizerFast.from_pretrained(model)
+    elif model == "distilbert-base-uncased":
+        return DistilBertTokenizerFast.from_pretrained(model)
+    else:
+        raise ValueError(f"Model: {model} not recognized.")
+
+def transform_text(text, tokenizer, config):
+    tokens = tokenizer(
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=config.max_token_length,
+        return_tensors="pt",
+    )
+    if config.model == "bert-base-uncased":
+        x = torch.stack(
+            (
+                tokens["input_ids"],
+                tokens["attention_mask"],
+                tokens["token_type_ids"],
+            ),
+            dim=2,
+        )
+    elif config.model == "distilbert-base-uncased":
+        x = torch.stack((tokens["input_ids"], tokens["attention_mask"]), dim=2)
+    x = torch.squeeze(x, dim=0)  # First shape dim is always 1
+    return x
 
 def initialize_bert_transform(config):
-    def get_bert_tokenizer(model):
-        if model == "bert-base-uncased":
-            return BertTokenizerFast.from_pretrained(model)
-        elif model == "distilbert-base-uncased":
-            return DistilBertTokenizerFast.from_pretrained(model)
-        else:
-            raise ValueError(f"Model: {model} not recognized.")
-
     assert "bert" in config.model
     assert config.max_token_length is not None
-
     tokenizer = get_bert_tokenizer(config.model)
+    return partial(transform_text, tokenizer=tokenizer, config=config)
 
-    def transform(text):
-        tokens = tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=config.max_token_length,
-            return_tensors="pt",
-        )
-        if config.model == "bert-base-uncased":
-            x = torch.stack(
-                (
-                    tokens["input_ids"],
-                    tokens["attention_mask"],
-                    tokens["token_type_ids"],
-                ),
-                dim=2,
-            )
-        elif config.model == "distilbert-base-uncased":
-            x = torch.stack((tokens["input_ids"], tokens["attention_mask"]), dim=2)
-        x = torch.squeeze(x, dim=0)  # First shape dim is always 1
-        return x
+def standardize(x: torch.Tensor) -> torch.Tensor:
+    mean = x.mean(dim=(1, 2))
+    std = x.std(dim=(1, 2))
+    std[std == 0.] = 1.
+    return TF.normalize(x, mean, std)
 
-    return transform
+def random_rotation(x: torch.Tensor, angles: List[int]) -> torch.Tensor:
+    angle = angles[torch.randint(low=0, high=len(angles), size=(1,))]
+    if angle > 0:
+        x = TF.rotate(x, angle)
+    return x
 
 def initialize_rxrx1_transform(is_training):
-    def standardize(x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=(1, 2))
-        std = x.std(dim=(1, 2))
-        std[std == 0.] = 1.
-        return TF.normalize(x, mean, std)
     t_standardize = transforms.Lambda(lambda x: standardize(x))
-
     angles = [0, 90, 180, 270]
-    def random_rotation(x: torch.Tensor) -> torch.Tensor:
-        angle = angles[torch.randint(low=0, high=len(angles), size=(1,))]
-        if angle > 0:
-            x = TF.rotate(x, angle)
-        return x
-    t_random_rotation = transforms.Lambda(lambda x: random_rotation(x))
+    t_random_rotation = transforms.Lambda(lambda x: partial(random_rotation(x), angles))
 
     if is_training:
         transforms_ls = [
@@ -243,20 +241,20 @@ def add_rand_augment_transform(config, dataset, base_transform_steps, normalizat
     )
     return transforms.Compose(strong_transform_steps)
 
+def unnormalize_rgb_in_poverty_ms_img(ms_img):
+    result = ms_img.detach().clone()
+    result[:3] = (result[:3] * poverty_rgb_stds) + poverty_rgb_means
+    return result
+
+def normalize_rgb_in_poverty_ms_img(ms_img):
+    result = ms_img.detach().clone()
+    result[:3] = (result[:3] - poverty_rgb_means) / poverty_rgb_stds
+    return ms_img
+
 def poverty_rgb_color_transform(ms_img, transform):
     from wilds.datasets.poverty_dataset import _MEANS_2009_17, _STD_DEVS_2009_17
     poverty_rgb_means = np.array([_MEANS_2009_17[c] for c in ['RED', 'GREEN', 'BLUE']]).reshape((-1, 1, 1))
     poverty_rgb_stds = np.array([_STD_DEVS_2009_17[c] for c in ['RED', 'GREEN', 'BLUE']]).reshape((-1, 1, 1))
-
-    def unnormalize_rgb_in_poverty_ms_img(ms_img):
-        result = ms_img.detach().clone()
-        result[:3] = (result[:3] * poverty_rgb_stds) + poverty_rgb_means
-        return result
-
-    def normalize_rgb_in_poverty_ms_img(ms_img):
-        result = ms_img.detach().clone()
-        result[:3] = (result[:3] - poverty_rgb_means) / poverty_rgb_stds
-        return ms_img
 
     color_transform = transforms.Compose([
         transforms.Lambda(lambda ms_img: unnormalize_rgb_in_poverty_ms_img(ms_img)),
@@ -269,30 +267,30 @@ def poverty_rgb_color_transform(ms_img, transform):
     ms_img[:3] = color_transform(ms_img[[2,1,0]])[[2,1,0]] # bgr to rgb to bgr
     return ms_img
 
+def poverty_color_jitter(ms_img):
+    return poverty_rgb_color_transform(
+        ms_img,
+        transforms.ColorJitter(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.1))
+
+def ms_cutout(ms_img):
+    def _sample_uniform(a, b):
+        return torch.empty(1).uniform_(a, b).item()
+
+    assert ms_img.shape[1] == ms_img.shape[2]
+    img_width = ms_img.shape[1]
+    cutout_width = _sample_uniform(0, img_width/2)
+    cutout_center_x = _sample_uniform(0, img_width)
+    cutout_center_y = _sample_uniform(0, img_width)
+    x0 = int(max(0, cutout_center_x - cutout_width/2))
+    y0 = int(max(0, cutout_center_y - cutout_width/2))
+    x1 = int(min(img_width, cutout_center_x + cutout_width/2))
+    y1 = int(min(img_width, cutout_center_y + cutout_width/2))
+
+    # Fill with 0 because the data is already normalized to mean zero
+    ms_img[:, x0:x1, y0:y1] = 0
+    return ms_img
+
 def add_poverty_rand_augment_transform(config, dataset, base_transform_steps):
-    def poverty_color_jitter(ms_img):
-        return poverty_rgb_color_transform(
-            ms_img,
-            transforms.ColorJitter(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.1))
-
-    def ms_cutout(ms_img):
-        def _sample_uniform(a, b):
-            return torch.empty(1).uniform_(a, b).item()
-
-        assert ms_img.shape[1] == ms_img.shape[2]
-        img_width = ms_img.shape[1]
-        cutout_width = _sample_uniform(0, img_width/2)
-        cutout_center_x = _sample_uniform(0, img_width)
-        cutout_center_y = _sample_uniform(0, img_width)
-        x0 = int(max(0, cutout_center_x - cutout_width/2))
-        y0 = int(max(0, cutout_center_y - cutout_width/2))
-        x1 = int(min(img_width, cutout_center_x + cutout_width/2))
-        y1 = int(min(img_width, cutout_center_y + cutout_width/2))
-
-        # Fill with 0 because the data is already normalized to mean zero
-        ms_img[:, x0:x1, y0:y1] = 0
-        return ms_img
-
     target_resolution = _get_target_resolution(config, dataset)
     strong_transform_steps = copy.deepcopy(base_transform_steps)
     strong_transform_steps.extend([
